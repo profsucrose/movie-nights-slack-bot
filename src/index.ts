@@ -141,6 +141,31 @@ app.message(async ({ message, client, say }) => {
             case "action": {
                 switch (item.action) {
                     case "add": {
+                        const alreadyQueued = rows.some(
+                            (row) => row.title == item.title
+                        );
+
+                        if (alreadyQueued) {
+                            // TODO: Prompt/logic should probably be better to prevent "misqueuing".
+                            const templates = [
+                                "Moovey tries to add {0} to the queue, but it appears to be already there.",
+                                "What's that? {0} is already queued—Moovey is shaken by your good taste.",
+                                "'Hmmm, how strange,' Moovey mumbles to himself. {0} is in the queue; it has always been in the queue.",
+                                "Moovey would add {0} to the queue, but you beat him to it, some time ago.",
+                            ];
+                            const template =
+                                templates[
+                                    Math.floor(Math.random() * templates.length)
+                                ];
+                            await reply(
+                                `> ${template.replace(
+                                    "{0}",
+                                    "_" + item.title + "_"
+                                )}`
+                            );
+                            break;
+                        }
+
                         // Recommendation if user didn't mention movie by name
                         // TODO: Make this more approximate—check ngrams
                         const moovey = !text
