@@ -39,6 +39,94 @@ ${queuedTitles.map((x) => "<item>" + x + "</item>").join("\n")}
 Before trying to <add> a movie, think to yourself whether it's already there. If it's there, say that it is and carry on. Else, add it.`;
 }
 
+interface User {
+    userId: string;
+    username: string;
+    realName: string;
+    memory: string;
+}
+
+function formatUserMemories(users: User[]): string | null {
+    if (users.every((u) => u.memory == "")) return null;
+
+    return `<memories>
+You can recall some things about the people talking to you.
+${users
+    .filter((u) => u.memory)
+    .map((u) => `${u.realName} - ${u.memory}`)
+    .join("\n\n")}
+</memories>`;
+}
+
+async function complete(
+    system: string,
+    prompt: string,
+    options?: { temperature?: number }
+): Promise<string> {
+    const data = {
+        messages: [
+            {
+                role: "system",
+                content: system,
+            },
+            {
+                role: "user",
+                content: prompt,
+            },
+        ],
+        model: "grok-beta",
+        stream: false,
+        temperature: 0.7,
+    };
+    if (options) {
+        Object.assign(data, options);
+    }
+    const response = await xai.post("chat/completions", data);
+    return response.data.choices[0];
+}
+
+async function rememberMessage(user: User, message: string, response: string) {
+    const system = `Your help a language model efficiently remember important information about a user from their messages. The model maintains a "memory" that is a brief blurb recalling interesting facts, experiences or interactions with them. Your task is to take a user's name, their existing memory (if there is one), a user message/model response interaction that was just had, and incorporate the latter into the memory. The user's name is ${user.realName}.`;
+
+    let preamble = user.memory
+        ? `\
+Here is the existing memory:
+<memory>
+${user.memory}
+</memory>\n`
+        : "";
+    let prompt =
+        preamble +
+        `\
+Here was the interaction:
+<user>
+${message}
+</user>
+<assistant>
+${response}
+</assistant>`;
+    if (user.memory) {
+        prompt += `\nPlease rewrite the memory to remember the interaction. Be concise. Output just the memory and nothing else.`;
+    } else {
+        prompt += `\nPlease write a new "memory" to remember the interaction (any facts, traits, experiences that the model should remember). Be concise. Output just the memory and nothing else.`;
+    }
+
+    const newMemory = await complete(system, prompt);
+    console.log(
+        "New memory for user",
+        user.userId,
+        user.username,
+        prompt,
+        newMemory
+    );
+
+    await db.run(
+        "UPDATE users SET memory = ? WHERE userId = ?",
+        newMemory,
+        user.userId
+    );
+}
+
 app.use(async ({ next }) => {
     await next();
 });
@@ -47,15 +135,76 @@ app.message(async ({ message, client, say }) => {
     console.log("got message!", message);
     if (!("text" in message)) return;
 
-    const text = message.text!;
-    if (!text?.includes(SLACK_ID)) {
-        // TODO: Maybe all replies in a thread should be responded to by Moovey?
-        // const rows: { id: number; threadTs: string }[] = await db.all(
-        //     "SELECT * FROM threads"
-        // );
-        // const knownThread = rows.some(r => r.threadTs == message.ts);
-        return;
-    }
+    const preprocess = (text: string): string => {
+        return text.replace(new RegExp(`^\\s*<@${SLACK_ID}>\\s*`), "");
+    };
+
+    const includeMessage = (text: string): boolean => {
+        return text.includes(SLACK_ID);
+    };
+
+    let text = message.text!;
+    if (!includeMessage(text)) return;
+
+    const thread = await client.conversations.replies({
+        channel: message.channel,
+        ts: message.ts,
+    });
+    const messages =
+        thread.messages?.filter(
+            (m) => m.text && m.user && includeMessage(m.text)
+        ) ?? [];
+
+    // Fetch relevant users
+    const fetchUsers = async (ids: string[]): Promise<User[]> => {
+        const storedUsers: {
+            userId: string;
+            username: string;
+            memory: string;
+        }[] = await db.all(
+            `SELECT * FROM users WHERE userId in (${ids.join(", ")})`
+        );
+
+        const fetchedUsers = (
+            await Promise.all(ids.map((id) => client.users.info({ user: id })))
+        ).map((u) => u.user!);
+
+        return await Promise.all(
+            fetchedUsers.map(async (user) => {
+                const stored = storedUsers.find((u) => u.userId == user.id);
+                let memory = stored?.memory ?? "";
+                if (!stored) {
+                    await db.run(
+                        "INSERT INTO users VALUES(?, ?, ?)",
+                        user.id,
+                        user.name,
+                        memory
+                    );
+                }
+                return {
+                    userId: user.id!,
+                    username: user.name!,
+                    memory,
+                    realName: user.real_name!,
+                };
+            })
+        );
+    };
+
+    const relevantUserIds = [
+        ...new Set(messages.map((m) => m.user!).concat([message.user!])),
+    ];
+    const users = await fetchUsers(relevantUserIds);
+    const threadTurns = messages.map((m) => {
+        const user = users.find((u) => u.userId == m.user!)!;
+        return `${user.realName}: ${preprocess(m.text!)}`;
+    });
+    const turn = preprocess(text);
+
+    // Naively demarcate messages. TODO: Better way of doing this?
+    let prompt = threadTurns.concat([turn]).join("<|separator|>\n\n");
+    let renderedMemories = formatUserMemories(users);
+    prompt = renderedMemories ? renderedMemories + "\n\n" + prompt : prompt;
 
     // CREATE TABLE IF NOT EXISTS movies (
     //     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,32 +222,12 @@ app.message(async ({ message, client, say }) => {
     console.log("rows", rows);
 
     const system = formatSystemPrompt(rows.map((row) => row.title) as string[]);
-
-    const data = {
-        messages: [
-            {
-                role: "system",
-                content: system,
-            },
-            {
-                role: "user",
-                content: text,
-            },
-        ],
-        model: "grok-beta",
-        stream: false,
-        temperature: 0.7,
-    };
-
-    const response = await xai.post("chat/completions", data);
-    const choice = response.data.choices[0];
-
-    let completion = choice.message.content as string;
+    let completion = await complete(system, prompt);
 
     // Bold to italics
     completion = completion.replaceAll(
-        /\*.+?\*/g,
-        (x) => "_" + x.slice(1, -1) + "_"
+        /(?<!\*)\*([^\*].+?[^\*])\*(?!=\*)/g,
+        "_$1_"
     );
 
     // Extract messages interleaved w/ adds and removes
@@ -136,6 +265,8 @@ app.message(async ({ message, client, say }) => {
     // Process sequence
     console.log("sequence", sequence);
     const reply = (text: string) => say({ text, thread_ts: message.ts });
+    const wait = (ms: number) =>
+        new Promise((resolve, _) => setTimeout(resolve, ms));
     sequence.forEach(async (item) => {
         switch (item.type) {
             case "action": {
@@ -150,7 +281,7 @@ app.message(async ({ message, client, say }) => {
                             const templates = [
                                 "Moovey tries to add {0} to the queue, but it appears to be already there.",
                                 "What's that? {0} is already queued—Moovey is shaken by your good taste.",
-                                "'Hmmm, how strange,' Moovey mumbles to himself. {0} is in the queue; it has always been in the queue.",
+                                "'Hmm, how strange,' Moovey mumbles to himself. {0} is in the queue; it has always been in the queue.",
                                 "Moovey would add {0} to the queue, but you beat him to it, some time ago.",
                             ];
                             const template =
@@ -203,7 +334,14 @@ app.message(async ({ message, client, say }) => {
                 break;
             }
         }
+
+        // Try to send items in order
+        // TODO: This should be unnecessary?
+        await wait(100);
     });
+
+    let user = users.find((u) => u.userId == message.user)!;
+    rememberMessage(user, text, completion);
 });
 
 (async () => {
